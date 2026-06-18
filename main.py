@@ -3,6 +3,7 @@ from fastapi import FastAPI, Query
 from services.wazuh_indexer import (
     search_latest_fim_events,
     search_fim_events_by_date,
+    iter_fim_events_by_date,
     count_fim_events_by_date,
     get_yesterday_date
 )
@@ -46,7 +47,18 @@ def analyze_llm_candidates_in_batches(
     batches = chunk_list(llm_candidates, batch_size)
 
     for batch_number, batch in enumerate(batches, start=1):
-        batch_analysis_results = analyze_fim_events_batch_with_llm(batch)
+        try:
+            batch_analysis_results = analyze_fim_events_batch_with_llm(batch)
+        except Exception as error:
+            batch_analysis_results = [
+                {
+                    "classification": "mencurigakan",
+                    "risk_score": 50,
+                    "reason": f"Analisis LLM gagal untuk batch ini: {str(error)}",
+                    "recommendation": "Periksa event secara manual dan cek koneksi/kapasitas layanan LLM."
+                }
+                for _event in batch
+            ]
 
         for event, llm_result in zip(batch, batch_analysis_results):
             analyzed_event = {
@@ -222,21 +234,48 @@ def analyze_daily_fim_events(
 @app.post("/fim/daily/analyze-and-send")
 def analyze_daily_and_send_fim_events_batch(
     date: Optional[str] = Query(default=None, description="Format: YYYY-MM-DD. Jika kosong, otomatis tanggal kemarin."),
-    size: int = Query(default=1000, ge=1, le=5000),
+    size: Optional[int] = Query(default=None, ge=1, le=100000, description="Legacy alias untuk max_events."),
+    max_events: Optional[int] = Query(default=None, ge=1, le=100000, description="Batas maksimal event yang diproses. Kosong berarti proses semua hasil query."),
+    page_size: int = Query(default=1000, ge=100, le=5000, description="Jumlah dokumen Wazuh per scroll page."),
     batch_size: int = Query(default=5, ge=1, le=20),
-    sleep_seconds: int = Query(default=2, ge=0, le=10)
+    sleep_seconds: int = Query(default=2, ge=0, le=10),
+    include_results: bool = Query(default=False, description="Jika true, response menyertakan detail event dan response Laravel.")
 ):
     selected_date = date or get_yesterday_date()
+    effective_max_events = max_events or size
 
     raw_count = count_fim_events_by_date(date=selected_date)
-    raw_events = search_fim_events_by_date(date=selected_date, size=size)
 
-    normalized_events = [
-        prepare_fim_event(hit)
-        for hit in raw_events
-    ]
+    page_count = 0
+    fetched_event_count = 0
+    normalized_event_count = 0
+    sent_count = 0
+    failed_send_count = 0
+    sent_results = []
+    error_samples = []
+    page_deduplicated_events = []
 
-    deduplicated_events = deduplicate_fim_events(normalized_events)
+    for page_count, raw_events in enumerate(
+        iter_fim_events_by_date(
+            date=selected_date,
+            page_size=page_size,
+            max_events=effective_max_events
+        ),
+        start=1
+    ):
+        fetched_event_count += len(raw_events)
+
+        normalized_events = [
+            prepare_fim_event(hit)
+            for hit in raw_events
+        ]
+        normalized_event_count += len(normalized_events)
+
+        page_deduplicated_events.extend(
+            deduplicate_fim_events(normalized_events)
+        )
+
+    deduplicated_events = deduplicate_fim_events(page_deduplicated_events)
 
     llm_candidates, rule_based_results = split_events_for_analysis(deduplicated_events)
 
@@ -247,33 +286,54 @@ def analyze_daily_and_send_fim_events_batch(
     )
 
     final_results = rule_based_results + llm_results
-
-    sent_results = []
+    summary = summarize_analysis_results(final_results)
 
     for event in final_results:
-        laravel_response = send_analysis_to_laravel(event)
+        try:
+            laravel_response = send_analysis_to_laravel(event)
+            sent_count += 1
 
-        sent_results.append({
-            "event": event,
-            "laravel_response": laravel_response
-        })
+            if include_results:
+                sent_results.append({
+                    "event": event,
+                    "laravel_response": laravel_response
+                })
+        except Exception as error:
+            failed_send_count += 1
 
-    return {
+            if len(error_samples) < 10:
+                error_samples.append({
+                    "wazuh_alert_id": event.get("wazuh_alert_id"),
+                    "indexer_doc_id": event.get("indexer_doc_id"),
+                    "file_path": event.get("file_path"),
+                    "error": str(error)
+                })
+
+    response = {
         "mode": "daily_analyze_and_send",
         "date": selected_date,
         "raw_event_count": raw_count,
-        "fetched_event_count": len(raw_events),
-        "normalized_event_count": len(normalized_events),
+        "max_events": effective_max_events,
+        "page_size": page_size,
+        "page_count": page_count,
+        "fetched_event_count": fetched_event_count,
+        "normalized_event_count": normalized_event_count,
         "deduplicated_event_count": len(deduplicated_events),
         "llm_candidate_count": len(llm_candidates),
         "rule_based_count": len(rule_based_results),
         "llm_batch_size": batch_size,
-        "llm_batch_count": len(chunk_list(llm_candidates, batch_size)),
         "sleep_seconds_between_batches": sleep_seconds,
-        "sent_count": len(sent_results),
-        "summary": summarize_analysis_results(final_results),
-        "results": sent_results
+        "analyzed_event_count": len(final_results),
+        "sent_count": sent_count,
+        "failed_send_count": failed_send_count,
+        "summary": summary,
+        "send_error_samples": error_samples
     }
+
+    if include_results:
+        response["results"] = sent_results
+
+    return response
 
 
 @app.post("/fim/analyze-and-send/daily")

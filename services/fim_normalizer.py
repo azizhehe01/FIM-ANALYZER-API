@@ -403,6 +403,9 @@ def build_llm_event_payload(event: Dict[str, Any]) -> Dict[str, Any]:
         "is_empty_file": event.get("is_empty_file"),
         "risk_hint": event.get("risk_hint"),
         "risk_hints": event.get("risk_hints"),
+        "occurrence_count": event.get("occurrence_count"),
+        "first_seen": event.get("first_seen"),
+        "last_seen": event.get("last_seen"),
         "diff": truncate_text(event.get("diff"), max_length=1200),
         "full_log": truncate_text(event.get("full_log"), max_length=800)
     }
