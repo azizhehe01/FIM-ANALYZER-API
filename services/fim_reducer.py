@@ -61,6 +61,38 @@ def is_directly_under_path(file_path: str, directory_marker: str) -> bool:
     return "/" not in remainder.strip("/")
 
 
+def is_wordpress_plugin_or_theme_path(file_path: str) -> bool:
+    normalized_path = file_path.replace("\\", "/").lower()
+
+    wordpress_code_paths = [
+        "/wp-content/plugins/",
+        "/wp_content/plugins/",
+        "/wp-content/themes/",
+        "/wp_content/themes/"
+    ]
+
+    return has_any_keyword(normalized_path, wordpress_code_paths)
+
+
+def is_normal_wordpress_plugin_or_theme_file(file_path: str) -> bool:
+    """
+    File normal plugin/theme biasanya berada di bawah folder slug plugin/theme,
+    bukan langsung di root wp-content/plugins atau wp-content/themes.
+    """
+
+    normalized_path = file_path.replace("\\", "/").lower()
+
+    if not is_wordpress_plugin_or_theme_path(normalized_path):
+        return False
+
+    return not (
+        is_directly_under_path(normalized_path, "/wp-content/plugins/")
+        or is_directly_under_path(normalized_path, "/wp_content/plugins/")
+        or is_directly_under_path(normalized_path, "/wp-content/themes/")
+        or is_directly_under_path(normalized_path, "/wp_content/themes/")
+    )
+
+
 def is_random_like_php_filename(file_path: str) -> bool:
     """
     Mendeteksi nama file PHP yang terlihat acak/obfuscated seperti oML9G.php.
@@ -154,13 +186,6 @@ def is_php_event_llm_candidate(event: Dict[str, Any]) -> bool:
         "/sessions/"
     ]
 
-    wordpress_code_paths = [
-        "/wp-content/plugins/",
-        "/wp_content/plugins/",
-        "/wp-content/themes/",
-        "/wp_content/themes/"
-    ]
-
     suspicious_path_keywords = [
         "shell",
         "webshell",
@@ -201,7 +226,7 @@ def is_php_event_llm_candidate(event: Dict[str, Any]) -> bool:
 
     is_sensitive_file = has_any_keyword(file_path, sensitive_php_files)
     is_risky_write_path = has_any_keyword(file_path, risky_write_paths)
-    is_wordpress_code_path = has_any_keyword(file_path, wordpress_code_paths)
+    is_wordpress_code_path = is_wordpress_plugin_or_theme_path(file_path)
     is_direct_wordpress_code_file = (
         is_directly_under_path(file_path, "/wp-content/plugins/")
         or is_directly_under_path(file_path, "/wp_content/plugins/")
@@ -308,6 +333,10 @@ def is_high_risk_candidate(event: Dict[str, Any]) -> bool:
     """
 
     file_path = (event.get("file_path") or "").lower()
+
+    # Berkas di dalam direktori WordPress upgrade diabaikan dari analisis LLM
+    if "wp-content/upgrade" in file_path or "wp_content/upgrade" in file_path:
+        return False
     event_type = (event.get("event_type") or "").lower()
     file_extension = (event.get("file_extension") or "").lower()
     risk_hints = [hint.lower() for hint in event.get("risk_hints", [])]
@@ -505,6 +534,17 @@ def apply_rule_based_classification(event: Dict[str, Any]) -> Dict[str, Any]:
     """
 
     file_path = (event.get("file_path") or "").lower()
+
+    # Berkas di dalam direktori WordPress upgrade langsung diklasifikasikan sebagai aman
+    if "wp-content/upgrade" in file_path or "wp_content/upgrade" in file_path:
+        return {
+            **event,
+            "classification": "aman",
+            "risk_score": 15,
+            "reason": "Event terjadi di dalam direktori upgrade WordPress sementara selama proses instalasi/pembaruan resmi.",
+            "recommendation": "Tidak diperlukan tindakan khusus. Berkas ini bersifat sementara dan biasanya dihapus otomatis oleh WordPress.",
+            "analysis_source": "rule_based"
+        }
     file_extension = (event.get("file_extension") or "").lower()
     risk_hints = [hint.lower() for hint in event.get("risk_hints", [])]
     rule_level = safe_int(event.get("rule_level"))
@@ -532,7 +572,19 @@ def apply_rule_based_classification(event: Dict[str, Any]) -> Dict[str, Any]:
         reason = "Event PHP custom tidak memenuhi kriteria prioritas LLM, tetapi tetap perlu dicatat karena terkait perubahan file PHP."
         recommendation = "Pantau pola perubahan file PHP dan review manual jika berasal dari direktori upload, cache, atau terjadi berulang."
 
-        if rule_id == PHP_FILE_ADDED_RULE_ID:
+        if is_normal_wordpress_plugin_or_theme_file(file_path):
+            classification = "aman"
+            risk_score = 25
+            reason = "Event berada di struktur normal plugin/theme WordPress dan tidak memenuhi indikator prioritas seperti nama acak, path upload/cache/tmp, file sensitif, konten mencurigakan, atau perubahan berulang."
+            recommendation = "Anggap sebagai perubahan plugin/theme yang wajar jika sesuai jadwal update atau maintenance WordPress."
+
+            if rule_id == PHP_FILE_ADDED_RULE_ID:
+                risk_score = 30
+                reason = "Terdapat penambahan file PHP di struktur normal plugin/theme WordPress tanpa indikator mencurigakan prioritas."
+            elif rule_id == PHP_FILE_DELETED_RULE_ID:
+                risk_score = 30
+                reason = "Terdapat penghapusan file PHP di struktur normal plugin/theme WordPress tanpa indikator mencurigakan prioritas."
+        elif rule_id == PHP_FILE_ADDED_RULE_ID:
             risk_score = max(risk_score, 45)
             reason = "Terdapat penambahan file PHP, namun tidak ditemukan indikator kuat seperti path upload, nama mencurigakan, konten berbahaya, atau perubahan berulang."
             recommendation = "Validasi apakah file PHP baru berasal dari deployment resmi."
