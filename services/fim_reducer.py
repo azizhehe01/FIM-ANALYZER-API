@@ -32,6 +32,27 @@ def is_custom_php_event(event: Dict[str, Any]) -> bool:
     return rule_id in CUSTOM_PHP_RULE_IDS or file_extension == ".php"
 
 
+# Berkas PHP/non-PHP yang diketahui normal ada di folder wflogs Wordfence.
+# Referensi: https://www.wordfence.com/help/firewall/
+WORDFENCE_WFLOGS_KNOWN_FILES = {
+    ".htaccess",
+    "attack-data.php",
+    "config.php",
+    "config-livewaf.php",
+    "config-synced.php",
+    "config-transient.php",
+    "config-array.php",
+    "config-plugins.php",
+    "config-waf.php",
+    "ips.php",
+    "rules.php",
+    "template.php",
+    "wordfence-waf.php",
+    "wfBrowscapCache.php",
+    "GeoLite2-Country.mmdb",
+}
+
+
 def has_any_keyword(text: str, keywords: List[str]) -> bool:
     return any(keyword in text for keyword in keywords)
 
@@ -327,6 +348,23 @@ def deduplicate_fim_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return list(grouped_events.values())
 
 
+def is_wordfence_logs_path(file_path: str) -> bool:
+    """
+    Mendeteksi apakah path berkas berada di dalam folder wflogs Wordfence.
+    """
+    return "wp-content/wflogs" in file_path or "wp_content/wflogs" in file_path
+
+
+def is_known_wordfence_file(file_path: str) -> bool:
+    """
+    Mendeteksi apakah berkas termasuk dalam daftar berkas resmi Wordfence.
+    Perbandingan dilakukan berdasarkan nama berkas (case-insensitive).
+    """
+    file_name = get_file_name(file_path).lower()
+    known_files_lower = {f.lower() for f in WORDFENCE_WFLOGS_KNOWN_FILES}
+    return file_name in known_files_lower
+
+
 def is_high_risk_candidate(event: Dict[str, Any]) -> bool:
     """
     Menentukan apakah event perlu dikirim ke LLM.
@@ -336,6 +374,12 @@ def is_high_risk_candidate(event: Dict[str, Any]) -> bool:
 
     # Berkas di dalam direktori WordPress upgrade diabaikan dari analisis LLM
     if "wp-content/upgrade" in file_path or "wp_content/upgrade" in file_path:
+        return False
+
+    # Berkas di dalam wflogs Wordfence:
+    # - Jika berkas dikenal (normal) -> tidak perlu LLM
+    # - Jika berkas tidak dikenal (anomali) -> bypass LLM, langsung berbahaya via rule-based
+    if is_wordfence_logs_path(file_path):
         return False
     event_type = (event.get("event_type") or "").lower()
     file_extension = (event.get("file_extension") or "").lower()
@@ -545,6 +589,29 @@ def apply_rule_based_classification(event: Dict[str, Any]) -> Dict[str, Any]:
             "recommendation": "Tidak diperlukan tindakan khusus. Berkas ini bersifat sementara dan biasanya dihapus otomatis oleh WordPress.",
             "analysis_source": "rule_based"
         }
+
+    # Berkas di dalam folder wflogs Wordfence
+    if is_wordfence_logs_path(file_path):
+        if is_known_wordfence_file(file_path):
+            return {
+                **event,
+                "classification": "aman",
+                "risk_score": 10,
+                "reason": "Event berasal dari berkas internal Wordfence yang dikenal di dalam folder wflogs. Perubahan pada berkas ini adalah perilaku normal plugin keamanan Wordfence saat memperbarui konfigurasi WAF, data serangan, atau aturan firewall.",
+                "recommendation": "Tidak diperlukan tindakan khusus. Pantau jika terjadi perubahan di luar jadwal pembaruan Wordfence yang normal.",
+                "analysis_source": "rule_based"
+            }
+        else:
+            # Berkas tidak dikenal ditemukan di dalam folder wflogs -> sangat mencurigakan
+            # Penyerang bisa menyembunyikan webshell di dalam folder plugin keamanan
+            return {
+                **event,
+                "classification": "berbahaya",
+                "risk_score": 90,
+                "reason": "Berkas yang tidak dikenal ditemukan di dalam folder wflogs Wordfence. Folder ini seharusnya hanya berisi berkas internal resmi Wordfence. Keberadaan berkas asing di sini merupakan indikator kuat adanya webshell atau backdoor yang sengaja disembunyikan di dalam folder plugin keamanan.",
+                "recommendation": "Segera periksa berkas ini secara manual. Hapus berkas jika tidak terkait dengan Wordfence dan lakukan pemindaian malware menyeluruh pada server.",
+                "analysis_source": "rule_based"
+            }
     file_extension = (event.get("file_extension") or "").lower()
     risk_hints = [hint.lower() for hint in event.get("risk_hints", [])]
     rule_level = safe_int(event.get("rule_level"))
