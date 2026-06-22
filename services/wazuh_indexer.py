@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 from typing import Iterator, List, Dict, Optional, Tuple
 
 import requests
@@ -110,32 +110,43 @@ def _build_custom_php_query(start_time: str, end_time: str) -> Dict:
 
 def get_yesterday_date() -> str:
     """
-    Mengambil tanggal kemarin dalam format YYYY-MM-DD berdasarkan UTC.
-
-    Catatan:
-    Query Wazuh yang dipakai menggunakan format Z/UTC.
+    Mengambil tanggal kemarin dalam format YYYY-MM-DD berdasarkan waktu lokal (WIB / UTC+7).
     """
 
-    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    tz_wib = timezone(timedelta(hours=7))
+    yesterday = datetime.now(tz_wib) - timedelta(days=1)
     return yesterday.strftime("%Y-%m-%d")
 
 
 def build_date_range(date: str) -> Tuple[str, str]:
     """
-    Membuat rentang waktu satu hari penuh berdasarkan tanggal tertentu.
+    Membuat rentang waktu satu hari penuh berdasarkan tanggal tertentu dalam WIB,
+    kemudian dikonversi ke format UTC (Z) untuk query Wazuh.
 
     Format input:
-    YYYY-MM-DD
+    YYYY-MM-DD (WIB)
 
     Output:
-    2026-05-31T00:00:00.000Z
-    2026-05-31T23:59:59.999Z
+    (start_time_utc, end_time_utc)
+    Contoh jika input "2026-06-22":
+    "2026-06-21T17:00:00.000Z"
+    "2026-06-22T16:59:59.999Z"
     """
 
-    start_time = f"{date}T00:00:00.000Z"
-    end_time = f"{date}T23:59:59.999Z"
-
-    return start_time, end_time
+    tz_wib = timezone(timedelta(hours=7))
+    
+    dt = datetime.strptime(date, "%Y-%m-%d")
+    
+    start_wib = datetime.combine(dt.date(), dt_time.min).replace(tzinfo=tz_wib)
+    end_wib = datetime.combine(dt.date(), dt_time.max).replace(tzinfo=tz_wib)
+    
+    start_utc = start_wib.astimezone(timezone.utc)
+    end_utc = end_wib.astimezone(timezone.utc)
+    
+    start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    end_str = end_utc.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    
+    return start_str, end_str
 
 
 def search_fim_events_by_date(

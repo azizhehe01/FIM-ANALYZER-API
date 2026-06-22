@@ -1,4 +1,8 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from services.wordpress_plugin_checker import (
+    check_plugin_on_wordpress_org,
+    get_plugin_slug_from_path
+)
 
 PHP_FILE_ADDED_RULE_ID = "100200"
 PHP_FILE_MODIFIED_RULE_ID = "100201"
@@ -470,6 +474,22 @@ def is_high_risk_candidate(event: Dict[str, Any]) -> bool:
     only_mtime_changed = changed_attributes == ["mtime"]
 
     if is_custom_php_event(event):
+        # Jika event PHP berasal dari subfolder plugin WordPress,
+        # gunakan WordPress.org API untuk memverifikasi keabsahan plugin
+        slug = get_plugin_slug_from_path(file_path)
+        if slug:
+            wp_result = check_plugin_on_wordpress_org(slug)
+
+            if wp_result["found"] is True:
+                # Plugin terdaftar di WP.org → pakai logika prioritas PHP biasa
+                return is_php_event_llm_candidate(event)
+            elif wp_result["found"] is False:
+                # Plugin TIDAK ada di WP.org (premium/nulled/unknown) → kirim ke LLM
+                return True
+            else:
+                # API error / tidak bisa dijangkau → fallback ke logika lama
+                return is_php_event_llm_candidate(event)
+
         return is_php_event_llm_candidate(event)
 
     # 0. File statis yang hanya berubah mtime dianggap tidak perlu LLM,
@@ -639,6 +659,18 @@ def apply_rule_based_classification(event: Dict[str, Any]) -> Dict[str, Any]:
         reason = "Event PHP custom tidak memenuhi kriteria prioritas LLM, tetapi tetap perlu dicatat karena terkait perubahan file PHP."
         recommendation = "Pantau pola perubahan file PHP dan review manual jika berasal dari direktori upload, cache, atau terjadi berulang."
 
+        # Verifikasi plugin via WordPress.org API
+        plugin_verified: Optional[bool] = None
+        plugin_name: Optional[str] = None
+        plugin_source: Optional[str] = None
+
+        slug = get_plugin_slug_from_path(file_path)
+        if slug:
+            wp_result = check_plugin_on_wordpress_org(slug)
+            plugin_verified = wp_result.get("found")
+            plugin_name = wp_result.get("name")
+            plugin_source = wp_result.get("source")
+
         if is_normal_wordpress_plugin_or_theme_file(file_path):
             classification = "aman"
             risk_score = 25
@@ -664,6 +696,15 @@ def apply_rule_based_classification(event: Dict[str, Any]) -> Dict[str, Any]:
             reason = "Terdapat penghapusan file PHP, namun file tidak termasuk path sensitif atau pola berulang prioritas LLM."
             recommendation = "Pastikan penghapusan file PHP sesuai aktivitas maintenance atau deployment."
 
+        # Jika plugin tidak ditemukan di WordPress.org, naikkan risk_score
+        if plugin_verified is False:
+            risk_score = max(risk_score, 55)
+            recommendation = (
+                "Plugin ini tidak ditemukan di direktori WordPress.org. "
+                "Ini bisa berarti plugin premium, plugin kustom, atau plugin nulled/ilegal. "
+                "Validasi secara manual apakah plugin berasal dari sumber yang terpercaya."
+            )
+
     # File statis umum lebih rendah risiko.
     if file_extension in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".css", ".log"]:
         risk_score = min(risk_score, 15)
@@ -681,7 +722,11 @@ def apply_rule_based_classification(event: Dict[str, Any]) -> Dict[str, Any]:
         "risk_score": risk_score,
         "reason": reason,
         "recommendation": recommendation,
-        "analysis_source": "rule_based"
+        "analysis_source": "rule_based",
+        "plugin_slug": get_plugin_slug_from_path(file_path),
+        "plugin_verified": plugin_verified if (rule_id in CUSTOM_PHP_RULE_IDS or file_extension == ".php") else None,
+        "plugin_name": plugin_name if (rule_id in CUSTOM_PHP_RULE_IDS or file_extension == ".php") else None,
+        "plugin_check_source": plugin_source if (rule_id in CUSTOM_PHP_RULE_IDS or file_extension == ".php") else None,
     }
 
 
